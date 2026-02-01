@@ -1,12 +1,16 @@
 import type { Api, Model } from "@mariozechner/pi-ai";
-import { discoverAuthStorage, discoverModels } from "@mariozechner/pi-coding-agent";
-
 import type { OpenClawConfig } from "../../config/config.js";
 import type { ModelDefinitionConfig } from "../../config/types.js";
 import { resolveOpenClawAgentDir } from "../agent-paths.js";
 import { DEFAULT_CONTEXT_TOKENS } from "../defaults.js";
 import { normalizeModelCompat } from "../model-compat.js";
 import { normalizeProviderId } from "../model-selection.js";
+import {
+  discoverAuthStorage,
+  discoverModels,
+  type AuthStorage,
+  type ModelRegistry,
+} from "../pi-model-discovery.js";
 
 type InlineModelEntry = ModelDefinitionConfig & { provider: string; baseUrl?: string };
 type InlineProviderConfig = {
@@ -15,12 +19,59 @@ type InlineProviderConfig = {
   models?: ModelDefinitionConfig[];
 };
 
+function isCloudflareAiGatewayUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return parsed.hostname === "gateway.ai.cloudflare.com";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Optional Cloudflare AI Gateway auth support.
+ *
+ * When routing OpenRouter traffic via Cloudflare AI Gateway with "Authenticated Gateway"
+ * enabled, Cloudflare requires a `cf-aig-authorization` header.
+ *
+ * We inject it at runtime from `CLOUDFLARE_AIG_TOKEN` (if set) so it never needs to be
+ * written to `openclaw.json` or `models.json`.
+ */
+export function maybeInjectCloudflareAiGatewayAuthHeader<TApi extends Api>(
+  model: Model<TApi>,
+  env: NodeJS.ProcessEnv = process.env,
+): Model<TApi> {
+  const token = String(env.CLOUDFLARE_AIG_TOKEN ?? "").trim();
+  if (!token) return model;
+
+  const baseUrl = String((model as { baseUrl?: unknown }).baseUrl ?? "").trim();
+  if (!baseUrl || !isCloudflareAiGatewayUrl(baseUrl)) return model;
+
+  // Cloudflare's OpenRouter provider endpoint is `.../openrouter...`.
+  // We scope this to OpenRouter to avoid surprising behavior for other providers.
+  const provider = String((model as { provider?: unknown }).provider ?? "").trim().toLowerCase();
+  if (provider !== "openrouter") return model;
+
+  const existingHeaders = (model as { headers?: Record<string, string> }).headers;
+  if (existingHeaders?.["cf-aig-authorization"]) return model;
+
+  return {
+    ...model,
+    headers: {
+      ...(existingHeaders ?? {}),
+      "cf-aig-authorization": `Bearer ${token}`,
+    },
+  };
+}
+
 export function buildInlineProviderModels(
   providers: Record<string, InlineProviderConfig>,
 ): InlineModelEntry[] {
   return Object.entries(providers).flatMap(([providerId, entry]) => {
     const trimmed = providerId.trim();
-    if (!trimmed) return [];
+    if (!trimmed) {
+      return [];
+    }
     return (entry?.models ?? []).map((model) => ({
       ...model,
       provider: trimmed,
@@ -35,13 +86,17 @@ export function buildModelAliasLines(cfg?: OpenClawConfig) {
   const entries: Array<{ alias: string; model: string }> = [];
   for (const [keyRaw, entryRaw] of Object.entries(models)) {
     const model = String(keyRaw ?? "").trim();
-    if (!model) continue;
+    if (!model) {
+      continue;
+    }
     const alias = String((entryRaw as { alias?: string } | undefined)?.alias ?? "").trim();
-    if (!alias) continue;
+    if (!alias) {
+      continue;
+    }
     entries.push({ alias, model });
   }
   return entries
-    .sort((a, b) => a.alias.localeCompare(b.alias))
+    .toSorted((a, b) => a.alias.localeCompare(b.alias))
     .map((entry) => `- ${entry.alias}: ${entry.model}`);
 }
 
@@ -53,8 +108,8 @@ export function resolveModel(
 ): {
   model?: Model<Api>;
   error?: string;
-  authStorage: ReturnType<typeof discoverAuthStorage>;
-  modelRegistry: ReturnType<typeof discoverModels>;
+  authStorage: AuthStorage;
+  modelRegistry: ModelRegistry;
 } {
   const resolvedAgentDir = agentDir ?? resolveOpenClawAgentDir();
   const authStorage = discoverAuthStorage(resolvedAgentDir);
@@ -68,7 +123,9 @@ export function resolveModel(
       (entry) => normalizeProviderId(entry.provider) === normalizedProvider && entry.id === modelId,
     );
     if (inlineMatch) {
-      const normalized = normalizeModelCompat(inlineMatch as Model<Api>);
+      const normalized = maybeInjectCloudflareAiGatewayAuthHeader(
+        normalizeModelCompat(inlineMatch as Model<Api>),
+      );
       return {
         model: normalized,
         authStorage,
@@ -77,7 +134,8 @@ export function resolveModel(
     }
     const providerCfg = providers[provider];
     if (providerCfg || modelId.startsWith("mock-")) {
-      const fallbackModel: Model<Api> = normalizeModelCompat({
+      const fallbackModel: Model<Api> = maybeInjectCloudflareAiGatewayAuthHeader(
+        normalizeModelCompat({
         id: modelId,
         name: modelId,
         api: providerCfg?.api ?? "openai-responses",
@@ -88,7 +146,8 @@ export function resolveModel(
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: providerCfg?.models?.[0]?.contextWindow ?? DEFAULT_CONTEXT_TOKENS,
         maxTokens: providerCfg?.models?.[0]?.maxTokens ?? DEFAULT_CONTEXT_TOKENS,
-      } as Model<Api>);
+        } as Model<Api>),
+      );
       return { model: fallbackModel, authStorage, modelRegistry };
     }
     return {
@@ -97,5 +156,9 @@ export function resolveModel(
       modelRegistry,
     };
   }
-  return { model: normalizeModelCompat(model), authStorage, modelRegistry };
+  return {
+    model: maybeInjectCloudflareAiGatewayAuthHeader(normalizeModelCompat(model)),
+    authStorage,
+    modelRegistry,
+  };
 }
